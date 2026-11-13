@@ -1,1 +1,419 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SATC e-commerce platform - network, security, data, compute
 
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+    AllowedValues: [prod]
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  AlertEmail:
+    Type: String
+    Description: Email address for alarm notifications
+  DbBackupDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    MaxValue: 35
+    Description: Automated backup retention in days (use 1 only on a Free-plan account)
+
+Resources:
+  # ---------- KMS ----------
+  DataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub satc-${Env}-data-key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowAutoScalingUse
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling' }
+            Action: ['kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:DescribeKey']
+            Resource: '*'
+          - Sid: AllowAutoScalingGrants
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling' }
+            Action: 'kms:CreateGrant'
+            Resource: '*'
+            Condition: { Bool: { 'kms:GrantIsForAWSResource': true } }
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/satc-${Env}-data'
+      TargetKeyId: !Ref DataKey
+
+  # ---------- NETWORK ----------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub 'satc-${Env}-vpc' }]
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: satc-igw }]
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref IGW }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref VPC, CidrBlock: 10.0.1.0/24, AvailabilityZone: !Select [0, !GetAZs ''], MapPublicIpOnLaunch: true, Tags: [{ Key: Name, Value: satc-public-a }] }
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref VPC, CidrBlock: 10.0.2.0/24, AvailabilityZone: !Select [1, !GetAZs ''], MapPublicIpOnLaunch: true, Tags: [{ Key: Name, Value: satc-public-b }] }
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref VPC, CidrBlock: 10.0.11.0/24, AvailabilityZone: !Select [0, !GetAZs ''], Tags: [{ Key: Name, Value: satc-app-a }] }
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref VPC, CidrBlock: 10.0.12.0/24, AvailabilityZone: !Select [1, !GetAZs ''], Tags: [{ Key: Name, Value: satc-app-b }] }
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref VPC, CidrBlock: 10.0.21.0/24, AvailabilityZone: !Select [0, !GetAZs ''], Tags: [{ Key: Name, Value: satc-db-a }] }
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref VPC, CidrBlock: 10.0.22.0/24, AvailabilityZone: !Select [1, !GetAZs ''], Tags: [{ Key: Name, Value: satc-db-b }] }
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties: { Domain: vpc }
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt NatEIP.AllocationId, SubnetId: !Ref PublicSubnetA, Tags: [{ Key: Name, Value: satc-nat-a }] }
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC, Tags: [{ Key: Name, Value: satc-public-rt }] }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: { RouteTableId: !Ref PublicRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW }
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC, Tags: [{ Key: Name, Value: satc-private-app-rt }] }
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PrivateRT, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGateway }
+  DbRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC, Tags: [{ Key: Name, Value: satc-private-db-rt }] }
+
+  PubAssocA: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRT } }
+  PubAssocB: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRT } }
+  AppAssocA: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref AppSubnetA, RouteTableId: !Ref PrivateRT } }
+  AppAssocB: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref AppSubnetB, RouteTableId: !Ref PrivateRT } }
+  DbAssocA: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref DbSubnetA, RouteTableId: !Ref DbRT } }
+  DbAssocB: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref DbSubnetB, RouteTableId: !Ref DbRT } }
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds: [!Ref PrivateRT]
+  DynamoEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      RouteTableIds: [!Ref PrivateRT]
+
+  # ---------- SECURITY GROUPS ----------
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: satc-alb-sg
+      GroupDescription: ALB public ingress
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 80,  ToPort: 80,  CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: satc-alb-sg }]
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: satc-app-sg
+      GroupDescription: App tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSG }
+      Tags: [{ Key: Name, Value: satc-app-sg }]
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: satc-db-sg
+      GroupDescription: Database tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSG }
+      Tags: [{ Key: Name, Value: satc-db-sg }]
+
+  # ---------- IAM ----------
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+      Policies:
+        - PolicyName: satc-app-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource: !GetAtt InventoryTable.Arn
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref DbSecret
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt DataKey.Arn
+  Ec2Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref Ec2Role] }
+
+  # ---------- DATA ----------
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub satc-${Env}-inventory
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: sku, AttributeType: S }]
+      KeySchema: [{ AttributeName: sku, KeyType: HASH }]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt DataKey.Arn }
+
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: { SSEAlgorithm: 'aws:kms', KMSMasterKeyID: !GetAtt DataKey.Arn }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionTransitions: [{ StorageClass: STANDARD_IA, TransitionInDays: 30 }]
+            NoncurrentVersionExpiration: { NoncurrentDays: 90 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub satc-${Env}/db-master
+      Description: SATC database master credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "satcadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: SATC DB subnets
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub satc-${Env}-pg
+      Engine: postgres
+      EngineVersion: '16'
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '20'
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt DataKey.Arn
+      MultiAZ: true
+      BackupRetentionPeriod: !Ref DbBackupDays
+      PreferredBackupWindow: '01:00-02:00'
+      DeletionProtection: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSG]
+      MasterUsername: satcadmin
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      CopyTagsToSnapshot: true
+  DbReplica:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub satc-${Env}-pg-replica1
+      SourceDBInstanceIdentifier: !Ref DbInstance
+      DBInstanceClass: !Ref DBInstanceClass
+      PubliclyAccessible: false
+
+  # ---------- MONITORING AGENT SETTINGS ----------
+  CwAgentParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: AmazonCloudWatch-satc-prod
+      Type: String
+      Value: |
+        {"metrics":{"append_dimensions":{"AutoScalingGroupName":"${aws:AutoScalingGroupName}"},"metrics_collected":{"mem":{"measurement":["mem_used_percent"]},"disk":{"measurement":["used_percent"],"resources":["/","/var/app/data"]}}}}
+
+  # ---------- COMPUTE ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub satc-${Env}-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt Ec2Profile.Arn }
+        SecurityGroupIds: [!Ref AppSG]
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled, HttpPutResponseHopLimit: 2 }
+        Monitoring: { Enabled: true }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeType: gp3, VolumeSize: 20, Encrypted: true, KmsKeyId: !GetAtt DataKey.Arn, DeleteOnTermination: true }
+          - DeviceName: /dev/sdf
+            Ebs: { VolumeType: gp3, VolumeSize: 30, Iops: 4000, Throughput: 250, Encrypted: true, KmsKeyId: !GetAtt DataKey.Arn, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Project, Value: SATC }]
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -x
+            dnf install -y nodejs20 ruby wget amazon-cloudwatch-agent
+
+            # mount the provisioned-IOPS data disk
+            DEV=/dev/nvme1n1
+            for i in $(seq 1 30); do [ -b $DEV ] && break; sleep 2; done
+            blkid $DEV || mkfs -t xfs $DEV
+            mkdir -p /var/app/data
+            mount $DEV /var/app/data
+            echo "$DEV /var/app/data xfs defaults,nofail 0 2" >> /etc/fstab
+
+            # placeholder app so health checks pass until the pipeline deploys
+            mkdir -p /var/app/current/dist
+            cat > /var/app/current/dist/server.js <<'EOF'
+            const http = require('http');
+            http.createServer((req, res) => {
+              if (req.url === '/health') { res.writeHead(200); return res.end('ok'); }
+              res.writeHead(200); res.end('SATC platform - placeholder');
+            }).listen(3000);
+            EOF
+            cat > /etc/systemd/system/satc-app.service <<'EOF'
+            [Unit]
+            Description=SATC app
+            After=network.target
+            [Service]
+            ExecStart=/usr/bin/node /var/app/current/dist/server.js
+            Restart=always
+            User=root
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now satc-app
+
+            # CloudWatch agent (memory and disk metrics)
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:AmazonCloudWatch-satc-prod
+
+            # CodeDeploy agent
+            TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+            REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+            cd /tmp
+            wget https://aws-codedeploy-$REGION.s3.$REGION.amazonaws.com/latest/install
+            chmod +x install
+            ./install auto
+            systemctl enable --now codedeploy-agent
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSG]
+      Tags: [{ Key: Name, Value: satc-prod-alb }]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 3000
+      Protocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+  Asg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: CwAgentParam
+    Properties:
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB]
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      MetricsCollection: [{ Granularity: 1Minute }]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Project, Value: SATC, PropagateAtLaunch: true }
+  CpuScaling:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref Asg
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 120
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 70
+
+Outputs:
+  VpcId:        { Value: !Ref VPC }
+  AlbDns:       { Value: !GetAtt Alb.DNSName }
+  DbEndpoint:   { Value: !GetAtt DbInstance.Endpoint.Address }
+  DbSecretArn:  { Value: !Ref DbSecret }
+  AssetsBucket: { Value: !Ref AssetsBucket }
+  AsgName:      { Value: !Ref Asg }
+  AlertTopic:   { Value: !Ref AlertTopic }

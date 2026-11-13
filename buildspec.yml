@@ -1,1 +1,25 @@
-
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - npm install
+  pre_build:
+    commands:
+      - npm run lint
+      - npm audit --audit-level=high
+      - npm test
+  build:
+    commands:
+      - npm run build
+  post_build:
+    commands:
+      - chmod +x scripts/*.sh
+      - echo "Build completed on $(date)"
+artifacts:
+  files:
+    - dist/**/*
+    - appspec.yml
+    - package.json
+    - scripts/**/*

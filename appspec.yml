@@ -1,1 +1,19 @@
-
+version: 0.0
+os: linux
+file_exists_behavior: OVERWRITE
+files:
+  - source: dist
+    destination: /var/app/current/dist
+hooks:
+  BeforeInstall:
+    - location: scripts/stop_app.sh
+      timeout: 60
+  AfterInstall:
+    - location: scripts/install_deps.sh
+      timeout: 120
+  ApplicationStart:
+    - location: scripts/start_app.sh
+      timeout: 60
+  ValidateService:
+    - location: scripts/health_check.sh
+      timeout: 120

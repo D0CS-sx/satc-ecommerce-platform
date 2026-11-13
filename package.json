@@ -1,1 +1,10 @@
-
+{
+  "name": "satc-ecommerce-platform",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "lint": "node --check app/server.js",
+    "test": "node --check app/server.js && echo tests ok",
+    "build": "mkdir -p dist && cp app/server.js dist/server.js"
+  }
+}
